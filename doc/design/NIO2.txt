@@ -1,0 +1,166 @@
+
+
+NIO.2
+=====
+
+
+Gathering writes and scattering reads are not supported in DatagramChannel
+--------------------------------------------------------------------------
+- DatagramChannel.read(ByteBuffer[]) and write(ByteBuffer[]) are only possible if the channel is *connected*
+- However, we cannot connect a DatagramChannel as this defeats the purpose of having 1 channel for *all* sends and receives
+- So we have to resort to DatagramChannel.send() and receive(), which works on unconnected channels, but provides no
+  support for gathering writes and scattering reads
+
+- UPDATE: gathering writes can be supported by simply connecting to the multicast address, e.g.
+  DatagramChannel.connect(new InetAddress.getByName("232.5.5.5"));
+  - On the receiver side, we cannot connect to 232.5.5.5, as the senders' address will be the individual IP addresses
+    - May not an issue as we may not have to do scattering reads on the receiver side...
+  - This doesn't work for sending and receiving *unicasts*, as we'll need to able to send / receive unicasts
+    to / from different destinations using the same datagram socket
+
+
+Direct buffers
+--------------
+- With the above restriction, direct buffers (ByteBuffer.allocateDirect()) cannot be supported for DatagramChannels,
+  only for SocketChannels.
+
+
+
+Scattering reads on the receiving side
+--------------------------------------
+- We could write the JGroups metadata first (e.g. length, version etc), then the Infinispan metadata (put/get), then the
+  Infinispan data (key/value, as direct buffer) and do a scattering read into 3 buffers on the receiving side
+  - To allocate direct memory for the Infinispan buffer, JGroups would have to invoke a callback (into Infinispan) to
+    obtain the buffer (via jemalloc). Not nice...
+- However, since scattering reads are not supported by datagram channels, we have to read the *entire* UDP datagram
+  packet into a fixed size (65K) buffer
+  - If the packet's size is much smaller than 65K (e.g. 10K) we can copy it and pass only the 10K up
+
+
+Direct buffers and fragmentation
+--------------------------------
+- Fragmentation _might_ defeat the purpose of direct buffers
+- Investigate whether a direct buffer can be broken into multiple direct buffers with different
+  offsets and lengths (should be possible with ByteBuffer.slice())
+
+
+Async Invocation API and buffer copying
+---------------------------------------
+- AIA can probably hold on to a buffer since that buffer was read into a new buffer in the transport
+- If the JGroups transport reused buffers, this would require a copy at the AIA level
+
+
+Non-blocking reads and writes
+-----------------------------
+- Non-blocking reads reduce the number of threads to be used: currently we use 1 thread per connection in TCP for
+  reading. With non-blocking reads, we can use 1 thread to handle reading data off the sockets of *all* members
+  (we'll probably use a thread pool instead of 1 thread).
+- Non-blocking writes, however, return immediately and the select() returns with an OP_WRITE key for a channel when
+  more data can be written.
+- This is problematic, as writers would never block, even if the TCP socket's send buffer is full. Writes would
+  probably be added to a queue, off of which the thread woken up in select() would dequeue and send messages.
+  --> This can cause out-of-memory exceptions, as too much data is buffered in memory
+  --> The heap-based queue is yet another buffer, but the socket already has a buffer of its own (the send window)
+  --> I suggest we leave writes blocking
+  --> Issue: we cannot do non-blocking reads and blocking writes on the same channel!
+  - Hmm, perhaps non-blocking writes can be used and a fixed number of messages can wait to be written in a bounded queue
+  - When the queue is full, subsequent messages would get dropped
+  - Retransmission takes care of resending the dropped messages anyway, and dropping has the effect that flow control
+    will throttle fast senders
+
+
+
+Memory-mapped files for exchange of messages between members on the same box
+----------------------------------------------------------------------------
+- No notifications when data is ready (FileChannel doesn't implement SelectableChannel)
+- Shared memory is difficult to use for multicasts (one producer - many consumers)
+  - E.g. a ring buffer could only advance its read pointer when it know that all consumers have read the buffer
+  - Even then, the buffer can not be overwritten until all members have purged the message via STABLE!
+
+
+
+Summary
+-------
+#1 The biggest advantage of NIO2 is its *asynchronous nature*: non-blocking reads/writes reduce the number of threads
+   used for *TCP*. NIO2 doesn't apply to UDP, which already is non-blocking, as we only have 2 sockets
+   (DatagramSocket, MulticastSocket) and 1 thread servicing each.
+
+#2 ByteBuffers have no advantage over {byte[],offset,length} tuples; as a matter of fact, each ByteBuffer carries
+   additional variables which occupy memory if many ByteBuffers are used
+   - If direct memory is used, then ByteBuffers are required: direct ByteBuffers don't allow access to the underlying
+     array
+
+#3 For multiple transports, NIO2 is not required
+
+#4 For exchange of messages between member on the same box, NIO2 can be used to access shared memory without having to
+   use JNI (memory mapped files)
+
+
+
+Main advantages of using NIO.2
+------------------------------
+- Fewer threads in TCP. However, this could also be achieved by reviving TCP_NIO (TCP_NIO2)
+- Direct memory (but only for TCP, and only on the send side)
+  --> Is this avoiding of 1 copy really that much faster (test perf)?
+
+
+
+Arguments against direct buffers
+--------------------------------
+- Big change in Message and all consumers of message
+- Big change in transport
+- ByteBuffer or wrapper/subclass will have to be used to do gathering writes and scattering reads
+- ByteBuffer is quite bulky compared to byte[]/offset/length (1 long + 2 ints):
+  - 4 ints and 1 long (Buffer)
+  - 1 long or more (inheritance) (ByteBuffer)
+  - hb (long), offset (int) isReadOnly (boolean)
+  - If we create a subclass, or wrap it, that will add another long (inheritance)
+  - We will need to subclass/wrap ByteBuffer because we'll need the release() method (see below)
+  - Instrumentation.getObjectSize(ByteBuffer.allocate(1024)):       48 bytes
+  - Instrumentation.getObjectSize(ByteBuffer.allocateDirect(1024)): 64 bytes !!
+  - Note that a JGroups message with dest, src and payload is only 40 bytes !!
+  - [1] claims even bigger sizes, e.g. 88 bytes for a 5 bytes HeapByteBuffer object !!
+- This does NOT work for UDP datagram channels, only for TCP sockets
+  - UDP datagram channels have to be connected for gathering writes, scatting reads to work (useless)
+- Memory management:
+  - Sending a direct ByteBuffer requires managing the buffer; it can only be released when JGroups marks a message
+    as stable (see by everyone). Requires a release() method, complicating matters
+    - What would a release() do ?
+  - If JGroups is to use direct memory to *receive* a message, how does it get the direct memory ?
+  - The app now also has to call release() on the ByteBuffer (subclass), to prevent JGroups from reusing direct memory
+    before the app is done. E.g. if Infinispan uses the async invocation API, then JGroups cannot immediately reuse the
+    direct buffer.
+    - How would JGroups allocate direct memory ? jemalloc ? --> nope
+
+
+
+Main disadvantages
+------------------
+- There have been reports that NIO is slower than BIO
+- Big change to the API (Message, JChannel.send() etc) --> I don't like this!
+- Bulky ByteBuffer class with too many unneeded fields (using a lot of memory)
+- Complicated ref counting with direct ByteBuffers (see below under "Issues")
+
+
+
+Issues
+------
+- When Infinispan uses jemalloc (which grabs a large off-heap memory area and manages allocated memory) and passes a
+  direct buffer to JGroups, then that buffer cannot be reused on send() returning, as it will be stored somewhere
+  (w.g. in NAKACK2) for potential retransmission, and can only get reused after STABLE purged the message.
+  - Looks like we'd have to introduce some ref-counted direct memory, which complicates things
+
+
+Misc
+----
+- There have been a number of reports that claim NIO is slower than BIO, investigate and run perf tests
+- Created NioServer/NioClient to test direct and heap-based ByteBuffers for sending and receiving of messages over
+  a SocketChannel. Results (testing on local mac, between mac and Linux workstation and on cluster01-16 lab) showed
+  that there was no perf difference between direct or heap-based memory!
+
+
+Refs
+----
+[1] http://btoddb-java-sizing.blogspot.ch
+
+

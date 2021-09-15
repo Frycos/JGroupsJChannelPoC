@@ -1,0 +1,16 @@
+[
+  {
+    "name" : "org.jgroups.protocols.TP",
+    "fields" : [
+      { "name" : "bind_addr",            "allowWrite" : true },
+      { "name" :  "bind_port",           "allowWrite" :  true},
+      { "name" :  "thread_pool_enabled", "allowWrite" :  true}
+    ]
+  },
+  {
+    "name": "org.jgroups.protocols.UNICAST3",
+    "fields": [
+      {"name": "conn_close_timeout"}
+    ]
+  }
+]
