@@ -9,3 +9,4 @@ This repo is based on the original repo https://github.com/belaban/JGroups. Seve
 2. Create your malicious serialized object and store it in `/tmp/pingme.ser`
 3. Create the second cluster member and type any message you like
 
+![Sample PoC](JChannelPoC.png?raw=true "Sample PoC")
